@@ -273,6 +273,17 @@ func (r *ReconcileVault) Reconcile(ctx context.Context, request reconcile.Reques
 		return reconcile.Result{}, fmt.Errorf("failed to create/update service: %v", err)
 	}
 
+	// Create the service if it doesn't exist
+	internalService := serviceForVaultInternal(v)
+	// Set Vault instance as the owner and controller
+	if err := controllerutil.SetControllerReference(v, internalService, r.scheme); err != nil {
+		return reconcile.Result{}, err
+	}
+	err = r.createOrUpdateObject(ctx, internalService)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to create/update internal service: %v", err)
+	}
+
 	// If we are using a LoadBalancer let the cloud-provider code fill in the hostname or IP of it,
 	// so we have a more stable certificate generation process.
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer && !v.Spec.IsTLSDisabled() && v.Spec.ExistingTLSSecretName == "" {
@@ -642,6 +653,42 @@ func serviceForVault(v *vaultv1alpha1.Vault) *corev1.Service {
 			// In case of multi-cluster deployments we need to publish the port
 			// before being considered ready, otherwise the LoadBalancer won't
 			// be able to direct traffic from the leader to the joining instance.
+			PublishNotReadyAddresses: v.Spec.IsRaftBootstrapFollower(),
+		},
+	}
+	return service
+}
+
+func serviceForVaultInternal(v *vaultv1alpha1.Vault) *corev1.Service {
+	ls := v.LabelsForVault()
+	// label to differentiate per-instance service and global service via label selection
+	ls["global_service"] = "true"
+	ls["service_type"] = "internal"
+
+	selectorLs := v.LabelsForVault()
+	// add the service_registration label
+	if v.Spec.ServiceRegistrationEnabled {
+		selectorLs["vault-active"] = "true"
+	}
+
+	servicePorts, _ := getServicePorts(v)
+
+	annotations := withVaultAnnotations(v, getCommonAnnotations(v, map[string]string{}))
+
+	servicePorts = append(servicePorts, corev1.ServicePort{Name: "metrics", Port: 9091})
+	servicePorts = append(servicePorts, corev1.ServicePort{Name: "statsd", Port: 9102})
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        v.Name + "-internal",
+			Namespace:   v.Namespace,
+			Annotations: annotations,
+			Labels:      withVaultLabels(v, ls),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:                     corev1.ServiceTypeClusterIP,
+			ClusterIP:                "None", // Make it a headless service
+			Selector:                 selectorLs,
+			Ports:                    servicePorts,
 			PublishNotReadyAddresses: v.Spec.IsRaftBootstrapFollower(),
 		},
 	}
@@ -1354,7 +1401,8 @@ func statefulSetForVault(v *vaultv1alpha1.Vault, externalSecretsToWatchItems []c
 			Labels:      withVaultLabels(v, ls),
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: &replicas,
+			Replicas:    &replicas,
+			ServiceName: v.Name + "-internal",
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.RollingUpdateStatefulSetStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
